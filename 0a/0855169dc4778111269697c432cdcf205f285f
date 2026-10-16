@@ -1,0 +1,19 @@
+src/pipeline.js
+  s_3c53ae68339318::t_f806b8b1c4337a 39,182-218,246,394
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0a0855169dc4778111269697c432cdcf205f285f",
+  "prompts": {},
+  "sessions": {
+    "s_3c53ae68339318": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a1448b-f656-7186-af32-299416777fef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Harshil Agrawal <harshil@cloudflare.com>"
+    }
+  }
+}
