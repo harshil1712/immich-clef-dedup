@@ -2,7 +2,7 @@
 
 Resolve duplicate photos in your [Immich](https://immich.app) library using Cloudflare's Clef decision models.
 
-This tool takes the duplicate pairs that Immich's built-in duplicate detection flags as "ambiguous" (where simple file-size rules can't decide) and sends them to **three Clef models simultaneously** for visual classification. Only pairs where **all three models agree** are auto-resolved; disagreements go to manual review.
+This tool takes duplicate groups from Immich's built-in duplicate detection that contain exactly two photos (where simple file-size rules can't decide) and sends them to **three Clef models simultaneously** for visual classification. Only pairs where **all three models agree** are auto-resolved; disagreements go to manual review.
 
 ## How it works
 
@@ -19,31 +19,40 @@ For each duplicate pair flagged by Immich:
 
 ## Results from a real run
 
-2,029 duplicate pairs processed through all 3 models:
+2,030 two-photo duplicate groups from a ~70,000-photo library. One pair errored before reaching the models; the other 2,029 went through all three. Numbers below are from the AI Gateway logs for that run (6,087 requests, zero failures).
 
-| | Clef (27B) | Clef-omni (30B) | Clef-flash (9B) |
+| | Clef (27B) | Clef-omni (30B-A3B) | Clef-flash (9B) |
 |---|---|---|---|
-| Avg latency | 2,218ms | **1,246ms** | 2,268ms |
-| Avg tokens | 2,328 | 2,324 | 2,328 |
-| Cost for all pairs | $1.11 | $0.69 | **$0.18** |
-| Avg confidence | 0.517 | 0.662 | **0.707** |
-| Errors | 0 | 0 | 0 |
+| Median latency | 1,308ms | **628ms** | 1,641ms |
+| p95 latency | 2,736ms | **748ms** | 2,187ms |
+| p99 latency | 7,055ms | **857ms** | 5,166ms |
+| Input tokens per request | 2,329 | 2,325 | 2,329 |
+| Cost for all pairs | $1.13 | $0.71 | **$0.18** |
+| Avg confidence | 0.519 | 0.662 | **0.708** |
+| Labeled "burst" | 476 | 23 | 35 |
 
-**Consensus results:**
+Latencies are request durations recorded by AI Gateway. Client-side timings (`_latency`) were ~600ms higher because they include uploading each ~1.3MB request.
+
+**Consensus results (2,030 pairs):**
 
 | | Count | Percentage |
 |---|---|---|
 | All 3 agree (auto-resolve) | 1,544 | 76.1% |
-| Disagreement (manual review) | 485 | 23.9% |
+| Disagreement (manual review) | 484 | 23.8% |
+| Clef returned no answer (manual review) | 1 | <0.1% |
+| Errored before reaching the models | 1 | <0.1% |
 
-**Total cost: $1.97** · **Wall-clock time: 103 minutes** · **Output tokens: FREE**
+Of the 1,544 consensus pairs, 1,538 were `same` (trash one copy) and 6 were `burst` (stack both).
+
+**Total cost: $2.02** · **Main run: 103 minutes** · **Output tokens: FREE**
 
 ### Interesting findings
 
-- **The 30B MoE model is the fastest** (1,246ms) — only 3B active parameters per inference makes it 1.8× faster than the 27B base model
-- **The 9B model has the highest confidence and lowest cost** — for binary decisions, model size doesn't matter
-- **The 27B base model is the conservative outlier** — it classified 467 pairs as "burst" while the other two saw only 22 and 34. It's seeing subtle frame differences the others don't
-- **Clef-omni and Clef-flash agree 97.7%** of the time — running just these two saves 56% of the cost ($0.87 vs $1.97)
+- **The 30B MoE model is the fastest.** Clef-omni has only 3B active parameters per token, and its median latency was ~2× lower than Clef and ~2.6× lower than Clef-flash.
+- **Parameter count does not predict latency.** The 27B Clef beat the 9B Clef-flash at the median, though with a much longer tail.
+- **The 27B base model is the conservative outlier.** It labeled 476 pairs as "burst" while the other two labeled 23 and 35. In 437 of the 484 disagreements, Clef said burst and the other two said same, usually with low confidence (median 0.23).
+- **Clef-omni and Clef-flash agree 97.7%** of the time. Running just these two costs $0.89 instead of $2.02.
+- **The quality question never decided a keeper.** No consensus pair had all three models pick a better photo, so every keeper was chosen by file size.
 
 ## Prerequisites
 
@@ -58,12 +67,13 @@ For each duplicate pair flagged by Immich:
   duplicate.resolve
   ```
 - A Cloudflare API token with Workers AI permission
-- Node.js 18+
+- Node.js 20.6+ (the npm scripts use `node --env-file`)
+- `ffmpeg`, only if you run the benchmark against HEIC originals
 
 ## Setup
 
 ```bash
-git clone https://github.com/your-username/immich-clef-dedup.git
+git clone https://github.com/harshil1712/immich-clef-dedup.git
 cd immich-clef-dedup
 npm install
 
@@ -129,9 +139,9 @@ The pipeline:
 
 - **Collect-only by default** — `--apply` flag required for any changes
 - **All trashed photos go to Immich's trash** — recoverable for 30 days
-- **Resume support** — saves progress every 50 pairs, can stop and restart
+- **Resume support** — saves progress every 50 pairs, can stop and restart. The final report covers all pairs, including resumed ones
 - **AI Gateway integration** — every request logged in your Cloudflare dashboard
-- **Full audit trail** — `pipeline-results.json` contains every model's raw response for every pair
+- **Full audit trail** — `pipeline-results.json` contains every model's parsed answer for every pair
 
 ## The questions we ask each model
 
@@ -183,24 +193,31 @@ Immich's binary endpoints return `Content-Type: application/octet-stream` regard
 
 ```javascript
 if (bytes[0] === 0xFF && bytes[1] === 0xD8) return 'jpeg';
-if (bytes[4] === 'f' && bytes[5] === 't' && bytes[6] === 'y' && bytes[7] === 'p') return 'heic';
+const ftyp = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
+if (ftyp === 'ftyp') return 'heic';
 ```
+
+The `ftyp` check also matches AVIF, MP4, and MOV (they share the ISO BMFF container). Check the brand at bytes 8–11 if your library contains those.
+
+Note that Clef only accepts PNG, JPEG, and WebP. A HEIC data URI is rejected with `image must be an embedded base64 data URI`, which does not mention the format. The pipeline avoids this by sending Immich's preview thumbnails, which are always JPEG.
 
 ### Thumbnail vs original
 
-Clef caps every image at ~1024×1024 pixels (1,024 tokens per image). Preview thumbnails at 1920×1440 already exceed this cap — originals add nothing. Thumbnails are JPEG (no HEIC conversion needed), 3× faster, and 6.5× smaller.
+Clef scales every image to about one megapixel and caps it at 1,024 tokens. Immich previews already exceed that, so originals add nothing. In the benchmark, thumbnails and originals got the same label on every pair that completed, with identical token counts, ~6× smaller requests, and lower latency.
+
+Full-resolution originals can also exceed Clef's 4 MiB per-image limit (`image exceeds the decoded byte limit`). The benchmark now skips those pairs' original comparison instead of failing.
 
 ## Cost breakdown
 
 | Model | Pricing | Cost for 2,029 pairs |
 |---|---|---|
-| Clef (27B) | $0.24/M input tokens | $1.11 |
-| Clef-omni (30B) | $0.15/M input tokens | $0.69 |
+| Clef (27B) | $0.24/M input tokens | $1.13 |
+| Clef-omni (30B) | $0.15/M input tokens | $0.71 |
 | Clef-flash (9B) | $0.038/M input tokens | $0.18 |
 | Output tokens | **FREE** | $0.00 |
-| **Total** | | **$1.97** |
+| **Total** | | **$2.02** |
 
-For a cheaper run: use only Clef-omni + Clef-flash (97.7% agreement rate) — $0.87 total.
+For a cheaper run: use only Clef-omni + Clef-flash (97.7% agreement rate) — $0.89 total. That is a one-line change to the `MODELS` array in `src/pipeline.js`.
 
 ## License
 
