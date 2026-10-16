@@ -54,11 +54,15 @@ async function heicToJpeg(buffer) {
  * Convert any image to JPEG, optionally resizing.
  * Handles HEIC (via ffmpeg) and JPEG/PNG (via sharp).
  *
- * @param {Buffer} buffer — raw image bytes
+ * @param {Buffer|ArrayBuffer|Uint8Array} input — raw image bytes
  * @param {number|null} maxDim — max dimension (null = keep original size)
  * @returns {Promise<{buffer: Buffer, base64: string, format: string, dimensions: {width, height}}>}
  */
-export async function toJpeg(buffer, maxDim = null) {
+export async function toJpeg(input, maxDim = null) {
+  // fetch() hands us an ArrayBuffer. ArrayBuffer#toString() ignores the
+  // 'base64' argument and returns "[object ArrayBuffer]", so normalize to a
+  // Node Buffer before anything else touches it.
+  const buffer = Buffer.isBuffer(input) ? input : Buffer.from(input);
   const format = sniffFormat(buffer);
   let jpegBuffer;
 
