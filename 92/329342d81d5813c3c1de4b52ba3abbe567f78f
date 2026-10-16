@@ -1,0 +1,19 @@
+src/convert.js
+  s_3c53ae68339318::t_7aae0d87762b43 57,61-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "92329342d81d5813c3c1de4b52ba3abbe567f78f",
+  "prompts": {},
+  "sessions": {
+    "s_3c53ae68339318": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a1448b-f656-7186-af32-299416777fef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Harshil Agrawal <harshil@cloudflare.com>"
+    }
+  }
+}
