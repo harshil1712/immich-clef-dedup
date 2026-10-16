@@ -21,6 +21,9 @@ const STATE = 'Compare two photos. Photo A is the first image, Photo B is the se
 
 const NUM_PAIRS = 20;
 
+// Clef rejects any image over 4 MiB decoded ("image exceeds the decoded byte limit").
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+
 // ─── response parser (matches verified Clef format) ───
 
 function parseAnswers(resp) {
@@ -37,7 +40,7 @@ function parseAnswers(resp) {
     quality: qly.choice || 'unknown',
     qlyProbabilities: qly.probabilities || {},
     qlyConfidence: qly.confidence || 0,
-    inputTokens: resp?.result?.usage?.input_tokens || 0,
+    inputTokens: (resp?.result?.usage || resp?.usage)?.input_tokens || 0,
   };
 }
 
@@ -61,7 +64,8 @@ async function main() {
 
   console.log('Fetching duplicate groups...');
   const groups = await getDuplicateGroups();
-  const pairs = groups.filter(g => g.assets?.length === 2).slice(0, NUM_PAIRS);
+  const allPairs = groups.filter(g => g.assets?.length === 2);
+  const pairs = allPairs.slice(0, NUM_PAIRS);
   console.log(`Found ${pairs.length} pairs\n`);
 
   const results = [];
@@ -92,6 +96,12 @@ async function main() {
         origB = await toJpeg(rawB.buffer, null);
       } catch (convErr) {
         console.log(`  ⚠️ original conversion failed: ${convErr.message.slice(0, 100)}`);
+        origConversionFailed = true;
+      }
+
+      if (!origConversionFailed && (origA.buffer.length > MAX_IMAGE_BYTES || origB.buffer.length > MAX_IMAGE_BYTES)) {
+        const mb = (n) => (n / 1024 / 1024).toFixed(1);
+        console.log(`  ⚠️ original exceeds Clef's 4 MiB per-image limit (${mb(origA.buffer.length)} MiB / ${mb(origB.buffer.length)} MiB) — skipping original comparison`);
         origConversionFailed = true;
       }
 
@@ -250,10 +260,10 @@ async function main() {
   }
 
   // Cost comparison
-  console.log('\n  ━━━ Cost estimate (for 3,456 pairs):');
+  console.log(`\n  ━━━ Cost estimate (for all ${allPairs.length.toLocaleString()} pairs):`);
   const tokensPerCall = valid[0]?.thumbOmni?.inputTokens || 2325;
-  const omniCost = (tokensPerCall * 3456 * 0.15) / 1_000_000;
-  const flashCost = (tokensPerCall * 3456 * 0.038) / 1_000_000;
+  const omniCost = (tokensPerCall * allPairs.length * 0.15) / 1_000_000;
+  const flashCost = (tokensPerCall * allPairs.length * 0.038) / 1_000_000;
   console.log(`     omni:  $${omniCost.toFixed(2)} ($0.15/M tokens)`);
   console.log(`     flash: $${flashCost.toFixed(2)} ($0.038/M tokens)`);
   console.log(`     savings with flash: $${(omniCost - flashCost).toFixed(2)}`);
