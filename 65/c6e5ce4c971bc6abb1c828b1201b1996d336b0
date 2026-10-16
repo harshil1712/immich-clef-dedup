@@ -1,0 +1,19 @@
+src/benchmark.js
+  s_3c53ae68339318::t_e7b2a2417f0ac6 24-26,43,67-68,102-107,263,265-266
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "65c6e5ce4c971bc6abb1c828b1201b1996d336b0",
+  "prompts": {},
+  "sessions": {
+    "s_3c53ae68339318": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a1448b-f656-7186-af32-299416777fef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Harshil Agrawal <harshil@cloudflare.com>"
+    }
+  }
+}
