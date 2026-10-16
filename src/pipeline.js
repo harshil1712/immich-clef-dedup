@@ -36,7 +36,7 @@ function parseDecision(resp) {
     quality: qly.choice || 'unknown',
     qualityProb: (qly.probabilities || {})[qly.choice] || 0,
     qualityConfidence: qly.confidence || 0,
-    inputTokens: resp?.result?.usage?.input_tokens || 0,
+    inputTokens: (resp?.result?.usage || resp?.usage)?.input_tokens || 0,
   };
 }
 
@@ -109,20 +109,6 @@ async function main() {
   // 2. Collect
   console.log(`2. Collecting decisions from ${MODELS.length} models...\n`);
 
-  // per-model data collection
-  const modelData = {};
-  for (const m of MODELS) {
-    modelData[m] = {
-      latencies: [],
-      tokens: [],
-      classifications: [],
-      qualities: [],
-      classConfidences: [],
-      qualityConfidences: [],
-      errors: 0,
-    };
-  }
-
   for (let i = startPos; i < pairs.length; i++) {
     const pair = pairs[i];
     const [assetA, assetB] = pair.assets;
@@ -160,19 +146,9 @@ async function main() {
           const parsed = parseDecision(result.value);
           entry[model] = parsed;
           entry[`${model}Latency`] = result.value._latency;
-
-          // collect stats
-          const d = modelData[model];
-          d.latencies.push(result.value._latency);
-          d.tokens.push(parsed?.inputTokens || 0);
-          d.classifications.push(parsed?.classification || 'unknown');
-          d.qualities.push(parsed?.quality || 'unknown');
-          d.classConfidences.push(parsed?.classificationConfidence || 0);
-          d.qualityConfidences.push(parsed?.qualityConfidence || 0);
         } else {
           entry[model] = null;
           entry[`${model}Error`] = result.reason?.message?.slice(0, 200) || 'unknown';
-          modelData[model].errors++;
         }
       }
 
@@ -203,6 +179,43 @@ async function main() {
   const valid = results.filter(r => !r.error && r.consensus);
   const errored = results.filter(r => r.error);
 
+  // Build per-model stats from ALL results, including pairs loaded from a
+  // previous (resumed) run. Collecting these inside the loop only covered the
+  // pairs processed in this invocation, while the consensus section below
+  // covers every pair — which made the two halves of the report disagree.
+  const modelData = {};
+  for (const m of MODELS) {
+    modelData[m] = {
+      latencies: [],
+      tokens: [],
+      classifications: [],
+      qualities: [],
+      classConfidences: [],
+      qualityConfidences: [],
+      errors: 0,
+    };
+  }
+  for (const r of results) {
+    if (r.error) continue;
+    for (const m of MODELS) {
+      const d = modelData[m];
+      if (r[`${m}Error`]) { d.errors++; continue; }
+      if (r[`${m}Latency`] === undefined) continue;
+      const parsed = r[m];
+      d.latencies.push(r[`${m}Latency`]);
+      d.tokens.push(parsed?.inputTokens || 0);
+      d.classifications.push(parsed?.classification || 'unknown');
+      d.qualities.push(parsed?.quality || 'unknown');
+      d.classConfidences.push(parsed?.classificationConfidence || 0);
+      d.qualityConfidences.push(parsed?.qualityConfidence || 0);
+    }
+  }
+
+  const resumedCount = existingResults.length;
+  if (resumedCount > 0) {
+    console.log(`  (stats include ${resumedCount} pairs resumed from pipeline-results.json)\n`);
+  }
+
   // ── Per-Model Performance Table ──
   console.log('  ━━━━ Per-Model Performance ━━━━\n');
   console.log(`  ${'Model'.padEnd(18)} ${'Calls'.padEnd(7)} ${'Avg(ms)'.padEnd(10)} ${'Med(ms)'.padEnd(10)} ${'P95(ms)'.padEnd(10)} ${'Avg tok'.padEnd(10)} ${'Cost/pair'.padEnd(11)} ${'Total cost'.padEnd(11)} ${'Errors'.padEnd(7)} ${'Avg conf'.padEnd(9)}`);
@@ -230,7 +243,7 @@ async function main() {
   console.log(`  ${'─'.repeat(18)} ${'─'.repeat(7)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(11)} $${totalCostAll.toFixed(2).padEnd(10)}`);
 
   console.log(`\n  Total API cost:  $${totalCostAll.toFixed(2)}`);
-  console.log(`  Wall-clock time: ${(pipelineElapsed / 1000).toFixed(0)}s (${(pipelineElapsed / 60000).toFixed(1)} min)`);
+  console.log(`  Wall-clock time: ${(pipelineElapsed / 1000).toFixed(0)}s (${(pipelineElapsed / 60000).toFixed(1)} min)${resumedCount ? ' — this invocation only' : ''}`);
 
   // ── Classification Distribution ──
   console.log('\n  ━━━━ Classification Distribution ━━━━\n');
@@ -378,7 +391,7 @@ async function main() {
 
   console.log(`\n  Results: pipeline-results.json`);
   console.log(`  Cost: $${totalCostAll.toFixed(2)}`);
-  console.log(`  Time: ${(pipelineElapsed / 1000).toFixed(0)}s`);
+  console.log(`  Time: ${(pipelineElapsed / 1000).toFixed(0)}s${resumedCount ? ' (this invocation only)' : ''}`);
   console.log('\n═══ DONE ═══\n');
 }
 
