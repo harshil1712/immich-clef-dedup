@@ -1,0 +1,6 @@
+node_modules/
+.env
+*.log
+pipeline-results.json
+benchmark-results.json
+pipeline-audit.json
