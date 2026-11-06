@@ -7,7 +7,6 @@
     "probe": "node --env-file=.env src/probe.js",
     "benchmark": "node --env-file=.env src/benchmark.js",
     "pipeline": "node --env-file=.env src/pipeline.js",
-    "eye-probe": "node --env-file=.env src/eye-probe.mjs",
     "eye-calibrate": "node --env-file=.env src/eye-tag-calibrate.mjs",
     "eye-tiebreak": "node --env-file=.env src/eye-tiebreak.mjs"
   },

@@ -144,12 +144,9 @@ Groups with any disputed photo are not resolved, because resolving a group clear
 
 ### 4. Eye tiebreaker (optional, macOS)
 
-[Desert Ant Labs Eye](https://desertant.com/models/eye/) is an on-device image model. These scripts use it to settle the comparisons the Clef models disagreed on, using `pipeline-results.json` from step 3. Inference runs locally through Core ML, so it costs nothing and no photos are uploaded.
+[Desert Ant Labs Eye](https://desertant.com/models/eye/) is an on-device image model. These two scripts use it to settle the comparisons the Clef models disagreed on, using `pipeline-results.json` from step 3. Inference runs locally through Core ML, so it costs nothing and no photos are uploaded.
 
 ```bash
-# inspect two specific assets: tags, similarity, Eye.duplicates, Eye.best
-npm run eye-probe -- <assetIdA> <assetIdB>
-
 # check whether tag divergence separates same-photo from burst pairs
 npm run eye-calibrate
 
