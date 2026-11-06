@@ -4,3 +4,5 @@ node_modules/
 pipeline-results.json
 benchmark-results.json
 pipeline-audit.json
+eye-tag-calibration.json
+eye-tiebreak-results.json

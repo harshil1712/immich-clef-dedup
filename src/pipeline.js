@@ -1,11 +1,11 @@
-// pipeline.js — collect results from all 3 Clef models for all duplicate pairs
+// pipeline.js — collect results from all 3 Clef models for all duplicate groups
 //
-// No destructive actions. Pure data collection + analysis.
-// Auto-resolve only where ALL 3 models agree.
+// Supports groups with 2+ assets (multi-duplicate groups).
+// For each group: pick the keeper (largest file), compare keeper vs each remaining asset.
 //
 // Usage:
-//   npm run pipeline              (all pairs)
-//   npm run pipeline -- 50       (first 50 pairs only)
+//   npm run pipeline              (all groups)
+//   npm run pipeline -- 50       (first 50 groups only)
 //   npm run pipeline -- --apply  (also apply consensus decisions)
 
 import { getDuplicateGroups, getAssetThumbnail, resolveDuplicates, createStack } from './immich.js';
@@ -13,7 +13,7 @@ import { askClef, DUPLICATE_QUESTIONS } from './clef.js';
 import { jpegDataUri } from './convert.js';
 import { writeFile, readFile } from 'fs/promises';
 
-const STATE = 'Compare two photos. Photo A is the first image, Photo B is the second image. Assess whether they are the same photo, different frames of the same moment (burst), or different photos. Also assess which photo has better quality.';
+const STATE = 'Compare two photos. Photo A is the first image (the probable original). Photo B is the second image. Assess whether they are the same exact photo (identical or near-identical), different frames of the same moment (burst photography), or genuinely different photos. Also assess which photo has better technical quality.';
 
 const MODELS = ['clef', 'omni', 'flash'];
 const MODEL_NAMES = { clef: 'Clef (27B)', omni: 'Clef-omni (30B)', flash: 'Clef-flash (9B)' };
@@ -24,10 +24,8 @@ const MODEL_PRICING = { clef: 0.24, omni: 0.15, flash: 0.038 };
 function parseDecision(resp) {
   const answers = resp?.result?.answers || resp?.answers;
   if (!answers) return null;
-
   const cls = answers.classification || {};
   const qly = answers.quality || {};
-
   return {
     classification: cls.choice || 'unknown',
     classificationProb: (cls.probabilities || {})[cls.choice] || 0,
@@ -40,24 +38,109 @@ function parseDecision(resp) {
   };
 }
 
-function analyzeConsensus(r) {
-  const classifications = MODELS.map(m => r[m]?.classification).filter(Boolean);
-  const qualities = MODELS.map(m => r[m]?.quality).filter(Boolean);
+// ─── multi-asset group processing ───
 
-  const allAgree = classifications.length === MODELS.length &&
-                    classifications.every(c => c === classifications[0]);
-  const qualityAgrees = qualities.length === MODELS.length &&
-                        qualities.every(q => q === qualities[0]);
+/**
+ * Pick the keeper for a group: the asset with the largest file size.
+ * Returns {keeper, others[]} — keeper is the likely original.
+ */
+function pickKeeper(assets) {
+  const sorted = [...assets].sort((a, b) => {
+    const aSize = a.exifInfo?.fileSizeInByte || 0;
+    const bSize = b.exifInfo?.fileSizeInByte || 0;
+    return bSize - aSize;
+  });
+  return {
+    keeper: sorted[0],
+    others: sorted.slice(1),
+  };
+}
 
-  let consensus = null;
-  if (allAgree) {
-    consensus = classifications[0];
-    if (qualityAgrees) {
-      consensus += ` / ${qualities[0]}`;
+/**
+ * Compare keeper against one other asset via all 3 models.
+ * Returns a comparison entry with per-model decisions and consensus.
+ */
+async function compareWithAllModels(keeperThumb, otherThumb) {
+  const uris = [jpegDataUri(keeperThumb.base64), jpegDataUri(otherThumb.base64)];
+
+  const responses = await Promise.allSettled(
+    MODELS.map(m => askClef(m, STATE, uris, DUPLICATE_QUESTIONS))
+  );
+
+  const entry = {};
+  for (let j = 0; j < MODELS.length; j++) {
+    const model = MODELS[j];
+    const result = responses[j];
+    if (result.status === 'fulfilled') {
+      entry[model] = parseDecision(result.value);
+      entry[`${model}Latency`] = result.value._latency;
+    } else {
+      entry[model] = null;
+      entry[`${model}Error`] = result.reason?.message?.slice(0, 200) || 'unknown';
     }
   }
 
-  return { allAgree, qualityAgrees, consensus, classifications, qualities };
+  // consensus for this comparison
+  const classifications = MODELS.map(m => entry[m]?.classification).filter(Boolean);
+  const allAgree = classifications.length === MODELS.length &&
+                    classifications.every(c => c === classifications[0]);
+
+  return { ...entry, consensus: { allAgree, classification: allAgree ? classifications[0] : null, classifications } };
+}
+
+/**
+ * Process a group of any size:
+ * 1. Pick keeper (largest file)
+ * 2. Compare keeper vs each other asset
+ * 3. Aggregate decisions for the group
+ * Returns a group result with per-comparison decisions and overall recommendation.
+ */
+async function processGroup(group, thumbnails) {
+  const { keeper, others } = pickKeeper(group.assets);
+
+  const groupResult = {
+    duplicateId: group.duplicateId,
+    keeper: { id: keeper.id, name: keeper.originalFileName, size: keeper.exifInfo?.fileSizeInByte || 0 },
+    others: others.map(a => ({ id: a.id, name: a.originalFileName, size: a.exifInfo?.fileSizeInByte || 0 })),
+    comparisons: [],
+  };
+
+  for (const other of others) {
+    const comp = await compareWithAllModels(thumbnails.get(keeper.id), thumbnails.get(other.id));
+    comp.otherId = other.id;
+    comp.otherName = other.originalFileName;
+    comp.otherSize = other.exifInfo?.fileSizeInByte || 0;
+    groupResult.comparisons.push(comp);
+  }
+
+  // aggregate group recommendation
+  const trashIds = [];
+  const stackIds = [];
+  const keepIds = [keeper.id];
+  const needsReview = [];
+
+  for (const comp of groupResult.comparisons) {
+    if (comp.consensus.allAgree) {
+      switch (comp.consensus.classification) {
+        case 'same':
+          trashIds.push(comp.otherId);
+          break;
+        case 'burst':
+          stackIds.push(comp.otherId);
+          break;
+        case 'different':
+          keepIds.push(comp.otherId);
+          break;
+        default:
+          needsReview.push({ id: comp.otherId, reason: `unknown classification: ${comp.consensus.classification}` });
+      }
+    } else {
+      needsReview.push({ id: comp.otherId, reason: 'model disagreement' });
+    }
+  }
+
+  groupResult.recommendation = { trashIds, stackIds, keepIds, needsReview };
+  return groupResult;
 }
 
 // ─── stats helpers ───
@@ -76,25 +159,38 @@ function avg(arr) {
 
 async function main() {
   const args = process.argv.slice(2);
-  const maxPairs = args.length > 0 && !isNaN(parseInt(args[0])) ? parseInt(args[0]) : null;
+  const maxGroups = args.length > 0 && !isNaN(parseInt(args[0])) ? parseInt(args[0]) : null;
   const apply = args.includes('--apply');
 
   const pipelineStart = Date.now();
 
   console.log('╔══════════════════════════════════════════════════════╗');
   console.log('║  Clef 3-Model Ensemble — Duplicate Resolution       ║');
+  console.log('║  (multi-asset group support)                        ║');
   console.log('╠══════════════════════════════════════════════════════╣');
   console.log(`║  Models:  ${MODELS.map(m => MODEL_NAMES[m]).join(' + ')}${' '.repeat(Math.max(0, 24 - MODELS.map(m => MODEL_NAMES[m]).join(' + ').length))}║`);
-  console.log(`║  Pairs:   ${maxPairs ? `first ${maxPairs}` : 'all'}${' '.repeat(45 - (maxPairs ? `first ${maxPairs}` : 'all').length)}║`);
+  console.log(`║  Groups:  ${maxGroups ? `first ${maxGroups}` : 'all'}${' '.repeat(45 - (maxGroups ? `first ${maxGroups}` : 'all').length)}║`);
   console.log(`║  Mode:    ${apply ? 'COLLECT + APPLY consensus' : 'COLLECT only (no changes)'}${' '.repeat(Math.max(0, 22 - (apply ? 'COLLECT + APPLY consensus'.length : 'COLLECT only'.length)))}║`);
   console.log('╚══════════════════════════════════════════════════════╝\n');
 
-  // 1. Fetch pairs
+  // 1. Fetch ALL duplicate groups (any size)
   console.log('1. Fetching duplicate groups...');
   const groups = await getDuplicateGroups();
-  const allPairs = groups.filter(g => g.assets?.length === 2);
-  const pairs = maxPairs ? allPairs.slice(0, maxPairs) : allPairs;
-  console.log(`   ${allPairs.length} total, processing ${pairs.length}\n`);
+
+  const eligible = groups.filter(g => g.assets?.length >= 2);
+  const limited = maxGroups ? eligible.slice(0, maxGroups) : eligible;
+
+  const groupSizes = {};
+  for (const g of eligible) {
+    const size = g.assets.length;
+    groupSizes[size] = (groupSizes[size] || 0) + 1;
+  }
+
+  console.log(`   ${eligible.length} total groups:`);
+  for (const [size, count] of Object.entries(groupSizes).sort()) {
+    console.log(`     ${size}-asset groups: ${count}`);
+  }
+  console.log(`   processing ${limited.length} groups\n`);
 
   // resume support
   let existingResults = [];
@@ -106,264 +202,174 @@ async function main() {
   const results = [...existingResults];
   const startPos = existingResults.length;
 
-  // 2. Collect
-  console.log(`2. Collecting decisions from ${MODELS.length} models...\n`);
+  // 2. Process each group
+  console.log(`2. Processing ${limited.length} groups with ${MODELS.length} models...\n`);
 
-  for (let i = startPos; i < pairs.length; i++) {
-    const pair = pairs[i];
-    const [assetA, assetB] = pair.assets;
-    const label = `${assetA.originalFileName} vs ${assetB.originalFileName}`;
+  for (let i = startPos; i < limited.length; i++) {
+    const group = limited[i];
+    const assetCount = group.assets.length;
+    const comparisonsNeeded = assetCount - 1;
+    const names = group.assets.map(a => a.originalFileName).join(', ');
 
     if (i % 10 === 0 || i === startPos) {
-      const pct = ((i - startPos) / (pairs.length - startPos) * 100).toFixed(0);
-      console.log(`   [${i + 1}/${pairs.length}] ${pct}% — ${label}`);
+      const pct = ((i - startPos) / (limited.length - startPos) * 100).toFixed(0);
+      console.log(`   [${i + 1}/${limited.length}] ${pct}% — ${assetCount} assets, ${comparisonsNeeded} comparisons — ${names.slice(0, 60)}`);
     }
 
     try {
-      const [tA, tB] = await Promise.all([
-        getAssetThumbnail(assetA.id, 'preview'),
-        getAssetThumbnail(assetB.id, 'preview'),
-      ]);
-      const uris = [jpegDataUri(tA.base64), jpegDataUri(tB.base64)];
+      // download all thumbnails for this group
+      const thumbPromises = group.assets.map(a => getAssetThumbnail(a.id, 'preview'));
+      const thumbs = await Promise.all(thumbPromises);
+      const thumbMap = new Map();
+      group.assets.forEach((a, j) => thumbMap.set(a.id, thumbs[j]));
 
-      // all 3 models in parallel
-      const responses = await Promise.allSettled(
-        MODELS.map(m => askClef(m, STATE, uris, DUPLICATE_QUESTIONS))
-      );
-
-      const entry = {
-        duplicateId: pair.duplicateId,
-        pair: label,
-        assetA: { id: assetA.id, name: assetA.originalFileName, size: assetA.exifInfo?.fileSizeInByte || 0 },
-        assetB: { id: assetB.id, name: assetB.originalFileName, size: assetB.exifInfo?.fileSizeInByte || 0 },
-      };
-
-      for (let j = 0; j < MODELS.length; j++) {
-        const model = MODELS[j];
-        const result = responses[j];
-
-        if (result.status === 'fulfilled') {
-          const parsed = parseDecision(result.value);
-          entry[model] = parsed;
-          entry[`${model}Latency`] = result.value._latency;
-        } else {
-          entry[model] = null;
-          entry[`${model}Error`] = result.reason?.message?.slice(0, 200) || 'unknown';
-        }
-      }
-
-      entry.consensus = analyzeConsensus(entry);
-      results.push(entry);
+      // process the group
+      results.push(await processGroup(group, thumbMap));
 
     } catch (err) {
-      results.push({ duplicateId: pair.duplicateId, pair: label, error: err.message.slice(0, 300) });
+      results.push({ duplicateId: group.duplicateId, error: err.message.slice(0, 300) });
     }
 
-    if ((i - startPos) % 50 === 49) {
+    if ((i - startPos) % 25 === 24) {
       await writeFile('pipeline-results.json', JSON.stringify(results, null, 2));
     }
 
     await new Promise(r => setTimeout(r, 400));
   }
 
-  // final save
   await writeFile('pipeline-results.json', JSON.stringify(results, null, 2));
 
   const pipelineElapsed = Date.now() - pipelineStart;
 
   // ─── 3. Analysis ───
-  console.log('\n\n3. ═════════════════════════════════════════════════════');
+  console.log('\n\n3. ═══════════════════════════════════════════════════════');
   console.log('    A N A L Y S I S');
   console.log('    ═════════════════════════════════════════════════════\n');
 
-  const valid = results.filter(r => !r.error && r.consensus);
+  const valid = results.filter(r => !r.error && r.comparisons);
   const errored = results.filter(r => r.error);
 
-  // Build per-model stats from ALL results, including pairs loaded from a
+  // Build per-model stats from ALL results, including groups loaded from a
   // previous (resumed) run. Collecting these inside the loop only covered the
-  // pairs processed in this invocation, while the consensus section below
-  // covers every pair — which made the two halves of the report disagree.
-  const modelData = {};
+  // groups processed in this invocation, while the outcome section below
+  // covers every group — which made the two halves of the report disagree.
+  const modelStats = {};
   for (const m of MODELS) {
-    modelData[m] = {
-      latencies: [],
-      tokens: [],
-      classifications: [],
-      qualities: [],
-      classConfidences: [],
-      qualityConfidences: [],
-      errors: 0,
-    };
+    modelStats[m] = { latencies: [], tokens: [], errors: 0, classifications: [], classConfidences: [] };
   }
-  for (const r of results) {
-    if (r.error) continue;
-    for (const m of MODELS) {
-      const d = modelData[m];
-      if (r[`${m}Error`]) { d.errors++; continue; }
-      if (r[`${m}Latency`] === undefined) continue;
-      const parsed = r[m];
-      d.latencies.push(r[`${m}Latency`]);
-      d.tokens.push(parsed?.inputTokens || 0);
-      d.classifications.push(parsed?.classification || 'unknown');
-      d.qualities.push(parsed?.quality || 'unknown');
-      d.classConfidences.push(parsed?.classificationConfidence || 0);
-      d.qualityConfidences.push(parsed?.qualityConfidence || 0);
+  let comparisonCount = 0;
+  for (const r of valid) {
+    for (const comp of r.comparisons) {
+      comparisonCount++;
+      for (const m of MODELS) {
+        const s = modelStats[m];
+        if (comp[`${m}Error`]) { s.errors++; continue; }
+        if (!comp[m]) continue;
+        s.latencies.push(comp[`${m}Latency`] || 0);
+        s.tokens.push(comp[m].inputTokens || 0);
+        s.classifications.push(comp[m].classification || 'unknown');
+        s.classConfidences.push(comp[m].classificationConfidence || 0);
+      }
     }
   }
 
-  const resumedCount = existingResults.length;
-  if (resumedCount > 0) {
-    console.log(`  (stats include ${resumedCount} pairs resumed from pipeline-results.json)\n`);
+  if (existingResults.length > 0) {
+    console.log(`  (stats include ${existingResults.length} groups resumed from pipeline-results.json)\n`);
   }
 
-  // ── Per-Model Performance Table ──
+  // per-model performance
   console.log('  ━━━━ Per-Model Performance ━━━━\n');
-  console.log(`  ${'Model'.padEnd(18)} ${'Calls'.padEnd(7)} ${'Avg(ms)'.padEnd(10)} ${'Med(ms)'.padEnd(10)} ${'P95(ms)'.padEnd(10)} ${'Avg tok'.padEnd(10)} ${'Cost/pair'.padEnd(11)} ${'Total cost'.padEnd(11)} ${'Errors'.padEnd(7)} ${'Avg conf'.padEnd(9)}`);
-  console.log(`  ${'─'.repeat(18)} ${'─'.repeat(7)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(11)} ${'─'.repeat(11)} ${'─'.repeat(7)} ${'─'.repeat(9)}`);
+  console.log(`  ${'Model'.padEnd(18)} ${'Calls'.padEnd(7)} ${'Avg(ms)'.padEnd(10)} ${'Med(ms)'.padEnd(10)} ${'P95(ms)'.padEnd(10)} ${'Cost/comp'.padEnd(11)} ${'Total cost'.padEnd(11)} ${'Errors'.padEnd(7)} ${'Avg conf'.padEnd(9)}`);
+  console.log(`  ${'─'.repeat(18)} ${'─'.repeat(7)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(11)} ${'─'.repeat(11)} ${'─'.repeat(7)} ${'─'.repeat(9)}`);
 
   let totalCostAll = 0;
   for (const m of MODELS) {
-    const d = modelData[m];
-    const calls = d.latencies.length;
-    const sorted = [...d.latencies].sort((a, b) => a - b);
-    const avgLat = avg(d.latencies);
+    const s = modelStats[m];
+    const calls = s.latencies.length;
+    const sorted = [...s.latencies].sort((a, b) => a - b);
+    const avgLat = avg(s.latencies);
     const medLat = percentile(sorted, 50);
     const p95Lat = percentile(sorted, 95);
-    const avgTok = avg(d.tokens);
-    const totalTok = d.tokens.reduce((s, v) => s + v, 0);
-    const costPerPair = calls > 0 ? (avgTok * MODEL_PRICING[m] / 1_000_000) : 0;
+    const avgTok = avg(s.tokens);
+    const totalTok = s.tokens.reduce((sum, v) => sum + v, 0);
+    const costPer = calls > 0 ? (avgTok * MODEL_PRICING[m] / 1_000_000) : 0;
     const totalCost = totalTok * MODEL_PRICING[m] / 1_000_000;
     totalCostAll += totalCost;
-    const avgConf = avg(d.classConfidences);
+    const avgConf = avg(s.classConfidences);
 
-    console.log(
-      `  ${MODEL_NAMES[m].padEnd(18)} ${String(calls).padEnd(7)} ${avgLat.toFixed(0).padEnd(10)} ${medLat.toFixed(0).padEnd(10)} ${p95Lat.toFixed(0).padEnd(10)} ${avgTok.toFixed(0).padEnd(10)} $${costPerPair.toFixed(5).padEnd(10)} $${totalCost.toFixed(2).padEnd(10)} ${String(d.errors).padEnd(7)} ${avgConf.toFixed(3).padEnd(9)}`
-    );
+    console.log(`  ${MODEL_NAMES[m].padEnd(18)} ${String(calls).padEnd(7)} ${avgLat.toFixed(0).padEnd(10)} ${medLat.toFixed(0).padEnd(10)} ${p95Lat.toFixed(0).padEnd(10)} $${costPer.toFixed(5).padEnd(10)} $${totalCost.toFixed(2).padEnd(10)} ${String(s.errors).padEnd(7)} ${avgConf.toFixed(3).padEnd(9)}`);
   }
-  console.log(`  ${'─'.repeat(18)} ${'─'.repeat(7)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(11)} $${totalCostAll.toFixed(2).padEnd(10)}`);
+  console.log(`  ${'─'.repeat(18)} ${'─'.repeat(7)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(11)} $${totalCostAll.toFixed(2).padEnd(10)}`);
+  console.log(`\n  Total comparisons: ${comparisonCount} (across ${valid.length} groups)`);
+  console.log(`  Total API cost:  $${totalCostAll.toFixed(2)}`);
+  console.log(`  Wall-clock time: ${(pipelineElapsed / 1000).toFixed(0)}s (${(pipelineElapsed / 60000).toFixed(1)} min)`);
 
-  console.log(`\n  Total API cost:  $${totalCostAll.toFixed(2)}`);
-  console.log(`  Wall-clock time: ${(pipelineElapsed / 1000).toFixed(0)}s (${(pipelineElapsed / 60000).toFixed(1)} min)${resumedCount ? ' — this invocation only' : ''}`);
+  // group outcomes
+  console.log('\n  ━━━━ Group Outcomes ━━━━\n');
 
-  // ── Classification Distribution ──
+  let totalTrash = 0, totalStack = 0, totalKeep = 0, totalReview = 0;
+  const groupsByOutcome = { 'full-consensus': 0, 'mixed': 0, 'no-consensus': 0 };
+
+  for (const r of valid) {
+    totalTrash += r.recommendation.trashIds.length;
+    totalStack += r.recommendation.stackIds.length;
+    totalKeep += r.recommendation.keepIds.length;
+    totalReview += r.recommendation.needsReview.length;
+
+    const allComparisonsAgree = r.comparisons.every(c => c.consensus.allAgree);
+    const noComparisonsAgree = r.comparisons.every(c => !c.consensus.allAgree);
+    if (allComparisonsAgree) groupsByOutcome['full-consensus']++;
+    else if (noComparisonsAgree) groupsByOutcome['no-consensus']++;
+    else groupsByOutcome['mixed']++;
+  }
+
+  console.log(`  Full consensus groups:  ${groupsByOutcome['full-consensus']} (all comparisons agree)`);
+  console.log(`  Mixed groups:           ${groupsByOutcome['mixed']} (some agree, some don't)`);
+  console.log(`  No-consensus groups:    ${groupsByOutcome['no-consensus']} (no comparisons agree)`);
+  console.log(`  Errored groups:         ${errored.length}`);
+  console.log(`\n  Asset outcomes:`);
+  console.log(`    → Trash (duplicates):    ${totalTrash}`);
+  console.log(`    → Stack (burst photos):  ${totalStack}`);
+  console.log(`    → Keep (different):      ${totalKeep}`);
+  console.log(`    → Needs review:          ${totalReview}`);
+
+  // classification distribution
   console.log('\n  ━━━━ Classification Distribution ━━━━\n');
   const clsTypes = ['same', 'burst', 'different', 'unknown'];
   console.log(`  ${'Model'.padEnd(18)} ${clsTypes.map(c => c.padEnd(11)).join(' ')}`);
   console.log(`  ${'─'.repeat(18)} ${clsTypes.map(() => '─'.repeat(11)).join(' ')}`);
-
   for (const m of MODELS) {
     const dist = {};
-    for (const c of modelData[m].classifications) {
+    for (const c of modelStats[m].classifications) {
       dist[c] = (dist[c] || 0) + 1;
     }
     console.log(`  ${MODEL_NAMES[m].padEnd(18)} ${clsTypes.map(c => String(dist[c] || 0).padEnd(11)).join(' ')}`);
   }
 
-  // ── Per-Classification Confidence ──
-  console.log('\n  ━━━━ Confidence by Classification ━━━━\n');
-  console.log(`  ${'Model'.padEnd(18)} ${'same conf'.padEnd(12)} ${'burst conf'.padEnd(12)} ${'diff conf'.padEnd(12)} ${'avg conf'.padEnd(10)}`);
-  console.log(`  ${'─'.repeat(18)} ${'─'.repeat(12)} ${'─'.repeat(12)} ${'─'.repeat(12)} ${'─'.repeat(10)}`);
-
-  for (const m of MODELS) {
-    const d = modelData[m];
-    const confsByCls = { same: [], burst: [], different: [] };
-    for (let i = 0; i < d.classifications.length; i++) {
-      const cls = d.classifications[i];
-      if (confsByCls[cls]) confsByCls[cls].push(d.classConfidences[i]);
-    }
-    const sameConf = avg(confsByCls.same);
-    const burstConf = avg(confsByCls.burst);
-    const diffConf = avg(confsByCls.different);
-    const avgAll = avg(d.classConfidences);
-    console.log(`  ${MODEL_NAMES[m].padEnd(18)} ${sameConf.toFixed(3).padEnd(12)} ${burstConf.toFixed(3).padEnd(12)} ${diffConf.toFixed(3).padEnd(12)} ${avgAll.toFixed(3).padEnd(10)}`);
-  }
-
-  // ── Pairwise Agreement Matrix ──
-  console.log('\n  ━━━━ Pairwise Model Agreement ━━━━\n');
-
-  for (let i = 0; i < MODELS.length; i++) {
-    for (let j = i + 1; j < MODELS.length; j++) {
-      const m1 = MODELS[i], m2 = MODELS[j];
-      let agree = 0, total = 0;
-      for (const r of valid) {
-        if (r[m1] && r[m2]) {
-          total++;
-          if (r[m1].classification === r[m2].classification) agree++;
-        }
-      }
-      console.log(`  ${MODEL_NAMES[m1]} ↔ ${MODEL_NAMES[m2]}: ${agree}/${total} agree (${(agree / (total || 1) * 100).toFixed(1)}%)`);
-    }
-  }
-
-  // ── 3-Way Consensus ──
-  console.log('\n  ━━━━ 3-Way Consensus ━━━━\n');
-
-  const fullAgreement = valid.filter(r => r.consensus.allAgree);
-  const partialAgreement = valid.filter(r => !r.consensus.allAgree && r.consensus.classifications.length > 1);
-  const noData = valid.filter(r => r.consensus.classifications.length === 0);
-
-  console.log(`  All 3 agree:     ${fullAgreement.length}/${valid.length} (${(fullAgreement.length / (valid.length || 1) * 100).toFixed(1)}%)`);
-  console.log(`  Partial agree:   ${partialAgreement.length}/${valid.length} (${(partialAgreement.length / (valid.length || 1) * 100).toFixed(1)}%)`);
-  console.log(`  No data:         ${noData.length}/${valid.length}`);
-  console.log(`  Errors:          ${errored.length}`);
-
-  if (partialAgreement.length > 0) {
-    console.log('\n  ━━━━ Disagreements ━━━━\n');
-    for (const r of partialAgreement.slice(0, 20)) { // first 20
-      console.log(`  ${r.pair}`);
-      for (const m of MODELS) {
-        if (r[m]) {
-          console.log(`    ${MODEL_NAMES[m].padEnd(18)} ${r[m].classification} (p=${r[m].classificationProb.toFixed(2)}, c=${r[m].classificationConfidence.toFixed(3)})`);
-        }
-      }
-    }
-    if (partialAgreement.length > 20) {
-      console.log(`  ... and ${partialAgreement.length - 20} more (see pipeline-results.json)`);
-    }
-  }
-
-  // ── Consensus Groups ──
-  if (fullAgreement.length > 0) {
-    console.log('\n  ━━━━ Consensus Groups (all 3 agree) ━━━━\n');
-    const groups = {};
-    for (const r of fullAgreement) {
-      const key = r.consensus.classifications[0];
-      groups[key] = (groups[key] || 0) + 1;
-    }
-    for (const [cls, count] of Object.entries(groups)) {
-      console.log(`  ${cls}: ${count} pairs`);
-    }
-  }
-
-  // ── Safe to Apply ──
-  const safeToResolve = fullAgreement.filter(r =>
-    r.consensus.classifications[0] === 'same'
-  );
-  const safeToStack = fullAgreement.filter(r =>
-    r.consensus.classifications[0] === 'burst'
-  );
-
-  console.log(`\n  ━━━━ Ready to Apply ━━━━\n`);
-  console.log(`  Auto-resolve (same):    ${safeToResolve.length} pairs`);
-  console.log(`  Auto-stack (burst):     ${safeToStack.length} pairs`);
-  console.log(`  Manual review (other):  ${valid.length - safeToResolve.length - safeToStack.length} pairs`);
-
-  if (apply && (safeToResolve.length > 0 || safeToStack.length > 0)) {
+  // ─── apply if requested ───
+  if (apply && valid.length > 0) {
     console.log(`\n4. Applying consensus decisions...\n`);
-    // ... same apply logic as before ...
-    const resolveGroups = [];
 
-    for (const r of safeToResolve) {
-      let keepId, trashId;
-      if (r.consensus.qualityAgrees && r.consensus.qualities[0] === 'first') {
-        keepId = r.assetA.id; trashId = r.assetB.id;
-      } else if (r.consensus.qualityAgrees && r.consensus.qualities[0] === 'second') {
-        keepId = r.assetB.id; trashId = r.assetA.id;
-      } else {
-        if (r.assetA.size >= r.assetB.size) { keepId = r.assetA.id; trashId = r.assetB.id; }
-        else { keepId = r.assetB.id; trashId = r.assetA.id; }
+    const resolveGroups = [];
+    const stackRequests = [];
+
+    for (const r of valid) {
+      const rec = r.recommendation;
+
+      // Resolving a group clears Immich's duplicate flag for every asset in it, so
+      // groups with disputed assets are left for manual review / eye-tiebreak.
+      if (rec.trashIds.length > 0 && rec.needsReview.length === 0) {
+        resolveGroups.push({
+          duplicateId: r.duplicateId,
+          keepAssetIds: rec.keepIds,
+          trashAssetIds: rec.trashIds,
+        });
       }
-      resolveGroups.push({ duplicateId: r.duplicateId, keepAssetIds: [keepId], trashAssetIds: [trashId] });
+
+      if (rec.stackIds.length > 0) {
+        const stackAssets = [r.keeper.id, ...rec.stackIds];
+        stackRequests.push(stackAssets);
+      }
     }
 
     const BATCH = 100;
@@ -373,25 +379,25 @@ async function main() {
       try {
         await resolveDuplicates(batch);
         applied += batch.length;
-        console.log(`   resolved ${applied}/${resolveGroups.length}`);
+        console.log(`   resolved ${applied}/${resolveGroups.length} groups`);
       } catch (err) {
         console.log(`   ⚠️ batch failed: ${err.message.slice(0, 200)}`);
       }
     }
 
-    for (const r of safeToStack) {
-      try { await createStack([r.assetA.id, r.assetB.id]); }
+    for (const ids of stackRequests) {
+      try { await createStack(ids); }
       catch (err) { console.log(`   ⚠️ stack failed: ${err.message.slice(0, 200)}`); }
     }
 
-    console.log(`\n   ✅ Applied: ${applied} resolves + ${safeToStack.length} stacks`);
+    console.log(`\n   ✅ Applied: ${applied} group resolves + ${stackRequests.length} stacks`);
   } else if (!apply) {
-    console.log(`\n  (run with --apply to apply the ${safeToResolve.length + safeToStack.length} consensus pairs)`);
+    const actionable = valid.filter(r => (r.recommendation.trashIds.length > 0 && r.recommendation.needsReview.length === 0) || r.recommendation.stackIds.length > 0);
+    console.log(`\n  (run with --apply to act on ${actionable.length} groups with consensus)`);
   }
 
   console.log(`\n  Results: pipeline-results.json`);
   console.log(`  Cost: $${totalCostAll.toFixed(2)}`);
-  console.log(`  Time: ${(pipelineElapsed / 1000).toFixed(0)}s${resumedCount ? ' (this invocation only)' : ''}`);
   console.log('\n═══ DONE ═══\n');
 }
 

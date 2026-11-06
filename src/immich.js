@@ -22,6 +22,12 @@ export async function getAssetOriginal(assetId) {
   return { buffer: buf, mime, base64: Buffer.from(buf).toString('base64') };
 }
 
+export async function getAsset(assetId) {
+  const res = await fetch(`${SERVER}/api/assets/${assetId}`, { headers });
+  if (!res.ok) throw new Error(`Immich asset fetch ${res.status}`);
+  return res.json();
+}
+
 export async function getAssetThumbnail(assetId, size = 'preview') {
   const res = await fetch(`${SERVER}/api/assets/${assetId}/thumbnail?size=${size}`, { headers });
   if (!res.ok) throw new Error(`Immich thumbnail fetch ${res.status}`);
