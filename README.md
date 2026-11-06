@@ -144,12 +144,9 @@ Groups with any disputed photo are not resolved, because resolving a group clear
 
 ### 4. Eye tiebreaker (optional, macOS)
 
-[Desert Ant Labs Eye](https://desertant.com/models/eye/) is an on-device image model. These two scripts use it to settle the comparisons the Clef models disagreed on, using `pipeline-results.json` from step 3. Inference runs locally through Core ML, so it costs nothing and no photos are uploaded.
+[Desert Ant Labs Eye](https://desertant.com/models/eye/) is an on-device image model. This script uses it to settle the comparisons the Clef models disagreed on, using `pipeline-results.json` from step 3. Inference runs locally through Core ML, so it costs nothing and no photos are uploaded.
 
 ```bash
-# check whether tag divergence separates same-photo from burst pairs
-npm run eye-calibrate
-
 # calibrate similarity thresholds, then tiebreak every disputed group (collect only)
 npm run eye-tiebreak
 
@@ -158,6 +155,8 @@ npm run eye-tiebreak -- --apply
 ```
 
 `eye-tiebreak` calibrates a similarity threshold on comparisons where all 3 Clef models agreed (`same` vs `burst`), then scores each disputed photo against its keeper. With `--apply` it only resolves a group when every disputed photo clears the threshold **and** `Eye.duplicates` groups it with the keeper. Clef's consensus decisions for the rest of the group are kept. If `Eye.best` prefers a disputed photo over the size-based keeper, that photo is kept instead. Results are saved to `eye-tiebreak-results.json`.
+
+Eye's tags were tested as an alternative signal and rejected: across 60 known-duplicate and 21 known-burst pairs, 88% of true duplicates also had divergent tags, so tag comparison cannot tell a re-encoded copy from a burst frame. The tiebreaker uses embedding similarity instead. Note that similarity alone did not separate the two classes cleanly either, so `--apply` additionally requires `Eye.duplicates` to group every disputed photo with the keeper.
 
 Eye is distributed under the [Desert Ant Labs Source-Available License](https://license.desertant.com/1.0), not an open-source license. It is free below its usage limits and requires attribution; check the terms before building on it.
 
