@@ -139,7 +139,7 @@ The pipeline:
 6. Saves full results to `pipeline-results.json`
 7. With `--apply`: resolves groups where every comparison reached consensus, and stacks burst frames with their keeper
 
-Groups with any disputed photo are not resolved, because resolving a group clears Immich's duplicate flag for all of its photos. Review those in Immich. An on-device tiebreaker was built to settle them and has been removed — see [Why not Eye?](#why-not-eye).
+Groups with any disputed photo are not resolved, because resolving a group clears Immich's duplicate flag for all of its photos. Review those in Immich.
 
 ### Safety features
 
@@ -225,23 +225,6 @@ Full-resolution originals can also exceed Clef's 4 MiB per-image limit (`image e
 | **Total** | | **$2.02** |
 
 For a cheaper run: use only Clef-omni + Clef-flash (97.7% agreement rate) — $0.89 total. That is a one-line change to the `MODELS` array in `src/pipeline.js`.
-
-## Why not Eye?
-
-An on-device tiebreaker was tried first, on the theory that local inference could settle the disagreements for free. It was removed because the signals it offers do not separate a re-encoded duplicate from a burst frame on real library data.
-
-Measured on 60 known-duplicate and 21 known-burst pairs (both classes taken from comparisons where all three Clef models agreed):
-
-| signal | result |
-|---|---|
-| tag divergence | 88% of true duplicates also had differing tags — unusable |
-| embedding similarity | same-class p10 `0.9805` vs burst-class max `1.0002` — the ranges overlap |
-| `Eye.duplicates()` | grouped 98.6% of disputed pairs with the keeper, including 361 of the 369 that similarity called different frames |
-| `Eye.best()` | never disagreed with the largest-file keeper in 856 groups |
-
-With the threshold forced into the overlap region, a run over 856 disputed groups produced 684 inconclusive, 149 "keep" verdicts that changed nothing, and 21 confident "trash" verdicts — for 24 assets, decided by a cutoff that known burst frames also pass. Trashing photos on that basis was not worth the risk, so the scripts, the `@desert-ant-labs/eye` dependency and the macOS requirement are all gone.
-
-The safe direction — using Eye to confirm two photos are genuinely different frames — was never validated, and is the only version of this worth revisiting.
 
 ## License
 
