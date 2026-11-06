@@ -2,7 +2,7 @@
 
 Resolve duplicate photos in your [Immich](https://immich.app) library using Cloudflare's Clef decision models.
 
-This tool takes duplicate groups from Immich's built-in duplicate detection (where simple file-size rules can't decide) and sends them to **three Clef models simultaneously** for visual classification. Only comparisons where **all three models agree** are auto-resolved; disagreements go to manual review, or to an optional on-device tiebreaker (see [Eye tiebreaker](#4-eye-tiebreaker-optional-macos)).
+This tool takes duplicate groups from Immich's built-in duplicate detection (where simple file-size rules can't decide) and sends them to **three Clef models simultaneously** for visual classification. Only comparisons where **all three models agree** are auto-resolved; disagreements go to manual review.
 
 ## How it works
 
@@ -73,7 +73,6 @@ Of the 1,544 consensus pairs, 1,538 were `same` (trash one copy) and 6 were `bur
 - A Cloudflare API token with Workers AI permission
 - Node.js 20.6+ (the npm scripts use `node --env-file`)
 - `ffmpeg`, only if you run the benchmark against HEIC originals
-- macOS, only for the optional Eye tiebreaker (it uses Eye's native Core ML build)
 
 ## Setup
 
@@ -140,25 +139,7 @@ The pipeline:
 6. Saves full results to `pipeline-results.json`
 7. With `--apply`: resolves groups where every comparison reached consensus, and stacks burst frames with their keeper
 
-Groups with any disputed photo are not resolved, because resolving a group clears Immich's duplicate flag for all of its photos. Review them in Immich, or run the Eye tiebreaker below.
-
-### 4. Eye tiebreaker (optional, macOS)
-
-[Desert Ant Labs Eye](https://desertant.com/models/eye/) is an on-device image model. This script uses it to settle the comparisons the Clef models disagreed on, using `pipeline-results.json` from step 3. Inference runs locally through Core ML, so it costs nothing and no photos are uploaded.
-
-```bash
-# calibrate similarity thresholds, then tiebreak every disputed group (collect only)
-npm run eye-tiebreak
-
-# also resolve groups where Eye is confident every disputed photo is a duplicate
-npm run eye-tiebreak -- --apply
-```
-
-`eye-tiebreak` calibrates a similarity threshold on comparisons where all 3 Clef models agreed (`same` vs `burst`), then scores each disputed photo against its keeper. With `--apply` it only resolves a group when every disputed photo clears the threshold **and** `Eye.duplicates` groups it with the keeper. Clef's consensus decisions for the rest of the group are kept. If `Eye.best` prefers a disputed photo over the size-based keeper, that photo is kept instead. Results are saved to `eye-tiebreak-results.json`.
-
-Eye's tags were tested as an alternative signal and rejected: across 60 known-duplicate and 21 known-burst pairs, 88% of true duplicates also had divergent tags, so tag comparison cannot tell a re-encoded copy from a burst frame. The tiebreaker uses embedding similarity instead. Note that similarity alone did not separate the two classes cleanly either, so `--apply` additionally requires `Eye.duplicates` to group every disputed photo with the keeper.
-
-Eye is distributed under the [Desert Ant Labs Source-Available License](https://license.desertant.com/1.0), not an open-source license. It is free below its usage limits and requires attribution; check the terms before building on it.
+Groups with any disputed photo are not resolved, because resolving a group clears Immich's duplicate flag for all of its photos. Review those in Immich. An on-device tiebreaker was built to settle them and has been removed — see [Why not Eye?](#why-not-eye).
 
 ### Safety features
 
@@ -167,7 +148,7 @@ Eye is distributed under the [Desert Ant Labs Source-Available License](https://
 - **Resume support** — saves progress every 25 groups, can stop and restart. The final report covers all groups, including resumed ones
 - **AI Gateway integration** — every request logged in your Cloudflare dashboard
 - **Full audit trail** — `pipeline-results.json` contains every model's parsed answer for every comparison
-- **Results stay local** — `pipeline-results.json`, `eye-*.json` and the benchmark output contain your filenames and asset IDs, and are gitignored
+- **Results stay local** — `pipeline-results.json` and the benchmark output contain your filenames and asset IDs, and are gitignored
 
 ## The questions we ask each model
 
@@ -245,6 +226,23 @@ Full-resolution originals can also exceed Clef's 4 MiB per-image limit (`image e
 
 For a cheaper run: use only Clef-omni + Clef-flash (97.7% agreement rate) — $0.89 total. That is a one-line change to the `MODELS` array in `src/pipeline.js`.
 
+## Why not Eye?
+
+An on-device tiebreaker was tried first, on the theory that local inference could settle the disagreements for free. It was removed because the signals it offers do not separate a re-encoded duplicate from a burst frame on real library data.
+
+Measured on 60 known-duplicate and 21 known-burst pairs (both classes taken from comparisons where all three Clef models agreed):
+
+| signal | result |
+|---|---|
+| tag divergence | 88% of true duplicates also had differing tags — unusable |
+| embedding similarity | same-class p10 `0.9805` vs burst-class max `1.0002` — the ranges overlap |
+| `Eye.duplicates()` | grouped 98.6% of disputed pairs with the keeper, including 361 of the 369 that similarity called different frames |
+| `Eye.best()` | never disagreed with the largest-file keeper in 856 groups |
+
+With the threshold forced into the overlap region, a run over 856 disputed groups produced 684 inconclusive, 149 "keep" verdicts that changed nothing, and 21 confident "trash" verdicts — for 24 assets, decided by a cutoff that known burst frames also pass. Trashing photos on that basis was not worth the risk, so the scripts, the `@desert-ant-labs/eye` dependency and the macOS requirement are all gone.
+
+The safe direction — using Eye to confirm two photos are genuinely different frames — was never validated, and is the only version of this worth revisiting.
+
 ## License
 
 MIT
@@ -254,4 +252,3 @@ MIT
 - [Immich](https://immich.app) — the photo management server
 - [Cloudflare Clef](https://developers.cloudflare.com/workers-ai/models/clef-omni/) — the decision models that make this possible
 - [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/) — request logging and analytics
-- [Desert Ant Labs Eye](https://desertant.com/models/eye/) — on-device image analysis for the tiebreaker

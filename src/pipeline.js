@@ -357,7 +357,7 @@ async function main() {
       const rec = r.recommendation;
 
       // Resolving a group clears Immich's duplicate flag for every asset in it, so
-      // groups with disputed assets are left for manual review / eye-tiebreak.
+      // groups with disputed assets are left for manual review.
       if (rec.trashIds.length > 0 && rec.needsReview.length === 0) {
         resolveGroups.push({
           duplicateId: r.duplicateId,
